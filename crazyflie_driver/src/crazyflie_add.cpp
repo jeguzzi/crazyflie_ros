@@ -21,6 +21,8 @@ int main(int argc, char **argv)
   bool enable_logging_pressure;
   bool enable_logging_battery;
   bool enable_logging_packets;
+  bool enable_logging_odom;
+  bool enable_logging_state;
 
   n.getParam("uri", uri);
   n.getParam("tf_prefix", tf_prefix);
@@ -35,6 +37,8 @@ int main(int argc, char **argv)
   n.param("enable_logging_pressure", enable_logging_pressure, true);
   n.param("enable_logging_battery", enable_logging_battery, true);
   n.param("enable_logging_packets", enable_logging_packets, true);
+  n.param("enable_logging_odom", enable_logging_odom, true);
+  n.param("enable_logging_state", enable_logging_state, true);
 
 
   ROS_INFO("wait_for_service /add_crazyflie");
@@ -55,6 +59,8 @@ int main(int argc, char **argv)
   addCrazyflie.request.enable_logging_pressure = enable_logging_pressure;
   addCrazyflie.request.enable_logging_battery = enable_logging_battery;
   addCrazyflie.request.enable_logging_packets = enable_logging_packets;
+  addCrazyflie.request.enable_logging_odom = enable_logging_odom;
+  addCrazyflie.request.enable_logging_state = enable_logging_state;
 
   std::vector<std::string> genericLogTopics;
   n.param("genericLogTopics", genericLogTopics, std::vector<std::string>());
