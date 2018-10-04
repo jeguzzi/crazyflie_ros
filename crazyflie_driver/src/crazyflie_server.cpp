@@ -50,6 +50,8 @@ double radToDeg(double rad) {
     return rad * 180.0 / pi();
 }
 
+enum RunningState { initializing, running, exception};
+
 class ROSLogger : public Logger
 {
 public:
@@ -135,8 +137,11 @@ public:
     , m_sentSetpoint(false)
     , m_sentExternalPosition(false)
   {
-    m_thread = std::thread(&CrazyflieROS::run, this);
+    state = initializing;
+    m_thread = std::thread(&CrazyflieROS::run_safe, this);
   }
+
+  RunningState state;
 
   ~CrazyflieROS()
   {
@@ -398,8 +403,21 @@ void cmdPositionSetpoint(
     m_sentExternalPosition = true;
   }
 
+  void run_safe()
+  {
+    try
+    {
+      run();
+    }
+    catch(std::exception& e) {
+        ROS_WARN("Exception %s while stopping CrazyflieROS ", e.what());
+    }
+  }
+
   void run()
   {
+    try
+    {
     ros::NodeHandle n;
     n.setCallbackQueue(&m_callback_queue);
 
@@ -572,6 +590,8 @@ void cmdPositionSetpoint(
     std::chrono::duration<double> elapsedSeconds = end-start;
     ROS_INFO("Elapsed: %f s", elapsedSeconds.count());
 
+    state = running;
+
     // Send 0 thrust initially for thrust-lock
     for (int i = 0; i < 100; ++i) {
        m_cf.sendSetpoint(0, 0, 0, 0);
@@ -598,7 +618,15 @@ void cmdPositionSetpoint(
     for (int i = 0; i < 100; ++i) {
        m_cf.sendSetpoint(0, 0, 0, 0);
     }
-
+  }
+  }
+  catch(std::runtime_error& e) {
+      ROS_WARN("Exception %s while running CrazyflieROS ", e.what());
+      state = exception;
+      while ( !m_isEmergency ) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+  }
   }
 
   void onImuData(uint32_t time_in_ms, logImu* data) {
@@ -906,8 +934,21 @@ private:
       req.enable_logging_battery,
       req.enable_logging_packets);
 
+    while(cf->state == initializing)
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if(cf->state == exception)
+    {
+      ROS_ERROR("Cannot add crazyflie with uri %s", req.uri.c_str());
+      cf->stop();
+      delete cf;
+      res.result = false;
+      return true;
+    }
+    ROS_INFO("Added crazyflie with uri %s", req.uri.c_str());
     m_crazyflies[req.uri] = cf;
-
+    res.result = true;
     return true;
   }
 
