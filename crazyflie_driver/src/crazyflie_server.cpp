@@ -138,6 +138,34 @@ public:
     m_thread = std::thread(&CrazyflieROS::run, this);
   }
 
+  ~CrazyflieROS()
+  {
+  if(m_serviceEmergency) m_serviceEmergency.shutdown();
+  if(m_serviceUpdateParams) m_serviceUpdateParams.shutdown();
+  if(m_serviceSetGroupMask) m_serviceSetGroupMask.shutdown();
+  if(m_serviceTakeoff) m_serviceTakeoff.shutdown();
+  if(m_serviceLand) m_serviceLand.shutdown();
+  if(m_serviceStop) m_serviceStop.shutdown();
+  if(m_serviceGoTo) m_serviceGoTo.shutdown();
+  if(m_serviceUploadTrajectory) m_serviceUploadTrajectory.shutdown();
+  if(m_serviceStartTrajectory) m_serviceStartTrajectory.shutdown();
+  if(m_sendPacketServer) m_sendPacketServer.shutdown();
+  if(m_subscribeCmdVel) m_subscribeCmdVel.shutdown();
+  if(m_subscribeCmdFullState) m_subscribeCmdFullState.shutdown();
+  if(m_subscribeCmdHover) m_subscribeCmdHover.shutdown();
+  if(m_subscribeCmdStop) m_subscribeCmdStop.shutdown();
+  if(m_subscribeCmdPosition) m_subscribeCmdPosition.shutdown();
+  if(m_subscribeExternalPosition) m_subscribeExternalPosition.shutdown();
+  if(m_pubImu) m_pubImu.shutdown();
+  if(m_pubTemp) m_pubTemp.shutdown();
+  if(m_pubMag) m_pubMag.shutdown();
+  if(m_pubPressure) m_pubPressure.shutdown();
+  if(m_pubBattery) m_pubBattery.shutdown();
+  if(m_pubRssi) m_pubRssi.shutdown();
+  for (size_t i = 0; i < m_pubLogDataGeneric.size(); i++) {
+    m_pubLogDataGeneric[i].shutdown();
+  }
+
   void stop()
   {
     ROS_INFO("Disconnecting ...");
