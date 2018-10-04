@@ -12,24 +12,26 @@
 #include "crazyflie_driver/UpdateParams.h"
 #include "crazyflie_driver/UploadTrajectory.h"
 #include "crazyflie_driver/sendPacket.h"
-
+#include "crazyflie_driver/FlightState.h"
 #include "crazyflie_driver/LogBlock.h"
 #include "crazyflie_driver/GenericLogData.h"
 #include "crazyflie_driver/FullState.h"
 #include "crazyflie_driver/Hover.h"
-#include "crazyflie_driver/Stop.h"
 #include "crazyflie_driver/Position.h"
 #include "crazyflie_driver/crtpPacket.h"
 #include "crazyflie_cpp/Crazyradio.h"
 #include "crazyflie_cpp/crtp.h"
 #include "std_srvs/Empty.h"
-#include <std_msgs/Empty.h>
+#include "std_msgs/Empty.h"
 #include "geometry_msgs/Twist.h"
 #include "geometry_msgs/PointStamped.h"
 #include "sensor_msgs/Imu.h"
 #include "sensor_msgs/Temperature.h"
 #include "sensor_msgs/MagneticField.h"
+#include "sensor_msgs/BatteryState.h"
+#include "nav_msgs/Odometry.h"
 #include "std_msgs/Float32.h"
+#include "tf/transform_broadcaster.h"
 
 //#include <regex>
 #include <thread>
@@ -97,7 +99,9 @@ public:
     bool enable_logging_magnetic_field,
     bool enable_logging_pressure,
     bool enable_logging_battery,
-    bool enable_logging_packets)
+    bool enable_logging_packets,
+    bool enable_logging_odom,
+    bool enable_logging_state)
     : m_cf(link_uri, rosLogger)
     , m_tf_prefix(tf_prefix)
     , m_isEmergency(false)
@@ -113,6 +117,8 @@ public:
     , m_enable_logging_pressure(enable_logging_pressure)
     , m_enable_logging_battery(enable_logging_battery)
     , m_enable_logging_packets(enable_logging_packets)
+    , m_enable_logging_odom(enable_logging_odom)
+    , m_enable_logging_state(enable_logging_state)
     , m_serviceEmergency()
     , m_serviceUpdateParams()
     , m_serviceSetGroupMask()
@@ -134,8 +140,14 @@ public:
     , m_pubPressure()
     , m_pubBattery()
     , m_pubRssi()
+    , m_pubOdom()
+    , m_pubState()
+    , m_tf_broadcaster()
     , m_sentSetpoint(false)
     , m_sentExternalPosition(false)
+    , m_is_flying_cache()
+    , m_voltage_cache()
+    , m_battery_level(1.0)
   {
     state = initializing;
     m_thread = std::thread(&CrazyflieROS::run_safe, this);
@@ -145,30 +157,33 @@ public:
 
   ~CrazyflieROS()
   {
-  if(m_serviceEmergency) m_serviceEmergency.shutdown();
-  if(m_serviceUpdateParams) m_serviceUpdateParams.shutdown();
-  if(m_serviceSetGroupMask) m_serviceSetGroupMask.shutdown();
-  if(m_serviceTakeoff) m_serviceTakeoff.shutdown();
-  if(m_serviceLand) m_serviceLand.shutdown();
-  if(m_serviceStop) m_serviceStop.shutdown();
-  if(m_serviceGoTo) m_serviceGoTo.shutdown();
-  if(m_serviceUploadTrajectory) m_serviceUploadTrajectory.shutdown();
-  if(m_serviceStartTrajectory) m_serviceStartTrajectory.shutdown();
-  if(m_sendPacketServer) m_sendPacketServer.shutdown();
-  if(m_subscribeCmdVel) m_subscribeCmdVel.shutdown();
-  if(m_subscribeCmdFullState) m_subscribeCmdFullState.shutdown();
-  if(m_subscribeCmdHover) m_subscribeCmdHover.shutdown();
-  if(m_subscribeCmdStop) m_subscribeCmdStop.shutdown();
-  if(m_subscribeCmdPosition) m_subscribeCmdPosition.shutdown();
-  if(m_subscribeExternalPosition) m_subscribeExternalPosition.shutdown();
-  if(m_pubImu) m_pubImu.shutdown();
-  if(m_pubTemp) m_pubTemp.shutdown();
-  if(m_pubMag) m_pubMag.shutdown();
-  if(m_pubPressure) m_pubPressure.shutdown();
-  if(m_pubBattery) m_pubBattery.shutdown();
-  if(m_pubRssi) m_pubRssi.shutdown();
-  for (size_t i = 0; i < m_pubLogDataGeneric.size(); i++) {
-    m_pubLogDataGeneric[i].shutdown();
+    if(m_serviceEmergency) m_serviceEmergency.shutdown();
+    if(m_serviceUpdateParams) m_serviceUpdateParams.shutdown();
+    if(m_serviceSetGroupMask) m_serviceSetGroupMask.shutdown();
+    if(m_serviceTakeoff) m_serviceTakeoff.shutdown();
+    if(m_serviceLand) m_serviceLand.shutdown();
+    if(m_serviceStop) m_serviceStop.shutdown();
+    if(m_serviceGoTo) m_serviceGoTo.shutdown();
+    if(m_serviceUploadTrajectory) m_serviceUploadTrajectory.shutdown();
+    if(m_serviceStartTrajectory) m_serviceStartTrajectory.shutdown();
+    if(m_sendPacketServer) m_sendPacketServer.shutdown();
+    if(m_subscribeCmdVel) m_subscribeCmdVel.shutdown();
+    if(m_subscribeCmdFullState) m_subscribeCmdFullState.shutdown();
+    if(m_subscribeCmdHover) m_subscribeCmdHover.shutdown();
+    if(m_subscribeCmdStop) m_subscribeCmdStop.shutdown();
+    if(m_subscribeCmdPosition) m_subscribeCmdPosition.shutdown();
+    if(m_subscribeExternalPosition) m_subscribeExternalPosition.shutdown();
+    if(m_pubImu) m_pubImu.shutdown();
+    if(m_pubTemp) m_pubTemp.shutdown();
+    if(m_pubMag) m_pubMag.shutdown();
+    if(m_pubPressure) m_pubPressure.shutdown();
+    if(m_pubBattery) m_pubBattery.shutdown();
+    if(m_pubRssi) m_pubRssi.shutdown();
+    if(m_pubOdom) m_pubOdom.shutdown();
+    if(m_pubState) m_pubState.shutdown();
+    for (size_t i = 0; i < m_pubLogDataGeneric.size(); i++) {
+      m_pubLogDataGeneric[i].shutdown();
+    }
   }
 
   void stop()
@@ -242,6 +257,37 @@ private:
     float baro_temp;
     float baro_pressure;
     float pm_vbat;
+  } __attribute__((packed));
+
+  struct logOdom {
+    float x;
+    float y;
+    float z;
+    float vx;
+    float vy;
+    float vz;
+  } __attribute__((packed));
+
+  struct logOrientation {
+    float qx;
+    float qy;
+    float qz;
+    float qw;
+  } __attribute__((packed));
+
+  struct logState {
+    int8_t flying;
+    int8_t can_fly;
+    uint16_t thrust;
+    int8_t battery_state;
+  } __attribute__((packed));
+
+  struct logBattery {
+    float battery_voltage;
+    float charge_current;
+    int8_t battery_state;
+    uint8_t battery_level;
+    uint16_t thrust;
   } __attribute__((packed));
 
 private:
@@ -451,10 +497,22 @@ void cmdPositionSetpoint(
       m_pubPressure = n.advertise<std_msgs::Float32>(m_tf_prefix + "/pressure", 10);
     }
     if (m_enable_logging_battery) {
-      m_pubBattery = n.advertise<std_msgs::Float32>(m_tf_prefix + "/battery", 10);
+      m_pubBattery = n.advertise<sensor_msgs::BatteryState>(m_tf_prefix + "/battery", 10);
     }
     if (m_enable_logging_packets) {
       m_pubPackets = n.advertise<crazyflie_driver::crtpPacket>(m_tf_prefix + "/packets", 10);
+    }
+    if (m_enable_logging_odom) {
+      m_pubOdom = n.advertise<nav_msgs::Odometry>(m_tf_prefix + "/odom", 1);
+      m_odom = nav_msgs::Odometry();
+      m_odom.header.frame_id = m_tf_prefix + "/odom";
+      m_odom.child_frame_id = m_tf_prefix + "/base_link";
+      m_odom.pose.covariance[0] = -1;
+      m_odom.twist.covariance[0] = -1;
+      m_odom.pose.pose.orientation.w = 1;
+    }
+    if (m_enable_logging_state) {
+      m_pubState = n.advertise<crazyflie_driver::FlightState>(m_tf_prefix + "/state", 1);
     }
     m_pubRssi = n.advertise<std_msgs::Float32>(m_tf_prefix + "/rssi", 10);
 
@@ -515,6 +573,11 @@ void cmdPositionSetpoint(
 
     std::unique_ptr<LogBlock<logImu> > logBlockImu;
     std::unique_ptr<LogBlock<log2> > logBlock2;
+    std::unique_ptr<LogBlock<logOdom> > logBlockOdom;
+    std::unique_ptr<LogBlock<logOrientation> > logBlockOrientation;
+    std::unique_ptr<LogBlock<logState> > logBlockState;
+    std::unique_ptr<LogBlock<logBattery> > logBlockBattery;
+
     std::vector<std::unique_ptr<LogBlockGeneric> > logBlocksGeneric(m_logBlocks.size());
     if (m_enableLogging) {
 
@@ -541,8 +604,7 @@ void cmdPositionSetpoint(
 
       if (   m_enable_logging_temperature
           || m_enable_logging_magnetic_field
-          || m_enable_logging_pressure
-          || m_enable_logging_battery)
+          || m_enable_logging_pressure)
       {
         std::function<void(uint32_t, log2*)> cb2 = std::bind(&CrazyflieROS::onLog2Data, this, std::placeholders::_1, std::placeholders::_2);
 
@@ -556,6 +618,56 @@ void cmdPositionSetpoint(
             {"pm", "vbat"},
           }, cb2));
         logBlock2->start(10); // 100ms
+      }
+
+      if ( m_enable_logging_battery )
+      {
+        std::function<void(uint32_t, logBattery*)> cbb = std::bind(&CrazyflieROS::onBatteryData, this, std::placeholders::_1, std::placeholders::_2);
+        logBlockBattery.reset(new LogBlock<logBattery>(
+          &m_cf,{
+            {"pm", "vbat"},
+            {"pm", "chargeCurrent"},
+            {"pm", "state"},
+          }, cbb));
+        logBlockBattery->start(100); // 1000ms
+      }
+
+      if (m_enable_logging_odom)
+      {
+        std::function<void(uint32_t, logOrientation*)> cb4 = std::bind(&CrazyflieROS::onOrientationData, this, std::placeholders::_1, std::placeholders::_2);
+        logBlockOrientation.reset(new LogBlock<logOrientation>(
+          &m_cf,{
+            {"stateEstimate", "qx"},
+            {"stateEstimate", "qy"},
+            {"stateEstimate", "qz"},
+            {"stateEstimate", "qw"}
+          }, cb4));
+        logBlockOrientation->start(5); // 50ms
+
+        std::function<void(uint32_t, logOdom*)> cb3 = std::bind(&CrazyflieROS::onOdomData, this, std::placeholders::_1, std::placeholders::_2);
+        logBlockOdom.reset(new LogBlock<logOdom>(
+          &m_cf,{
+            {"stateEstimate", "x"},
+            {"stateEstimate", "y"},
+            {"stateEstimate", "z"},
+            {"stateEstimate", "vx"},
+            {"stateEstimate", "vy"},
+            {"stateEstimate", "vz"},
+          }, cb3));
+        logBlockOdom->start(5); // 50ms
+      }
+
+      if (m_enable_logging_state)
+      {
+        std::function<void(uint32_t, logState*)> cb5 = std::bind(&CrazyflieROS::onStateData, this, std::placeholders::_1, std::placeholders::_2);
+        logBlockState.reset(new LogBlock<logState>(
+          &m_cf,{
+            {"kalman", "inFlight"},
+            {"sys", "canfly"},
+            {"stabilizer", "thrust"},
+            {"pm", "state"},
+          }, cb5));
+        logBlockState->start(50); // 500ms
       }
 
       // custom log blocks
@@ -578,8 +690,6 @@ void cmdPositionSetpoint(
         logBlocksGeneric[i]->start(logBlock.frequency / 10);
         ++i;
       }
-
-
     }
 
     ROS_INFO("Requesting memories...");
@@ -618,7 +728,6 @@ void cmdPositionSetpoint(
     for (int i = 0; i < 100; ++i) {
        m_cf.sendSetpoint(0, 0, 0, 0);
     }
-  }
   }
   catch(std::runtime_error& e) {
       ROS_WARN("Exception %s while running CrazyflieROS ", e.what());
@@ -692,11 +801,130 @@ void cmdPositionSetpoint(
       m_pubPressure.publish(msg);
     }
 
+    // if (m_enable_logging_battery) {
+    //   std_msgs::Float32 msg;
+    //   // V
+    //   msg.data = data->pm_vbat;
+    //   m_pubBattery.publish(msg);
+    // }
+  }
+
+  float sigmoid(float x, float x0, float k)
+  {
+    return 1 / (1 + exp(-k * (x-x0)));
+  }
+
+  float battery_level(float voltage, bool is_flying)
+  {
+    if(!is_flying) voltage = voltage -  0.32;
+    return sigmoid(voltage, 3.4917872, 10.02713555);
+  }
+
+  void update_voltage(float voltage, uint16_t thrust, uint8_t level, int8_t state)
+  {
+    if(state == 1 || state == 2)
+      {
+        m_battery_level = float(level) / 100.0;
+        return;
+      }
+
+      bool is_flying = thrust > 0;
+      m_is_flying_cache.push_back(is_flying);
+      m_voltage_cache.push_back(voltage);
+      if(m_is_flying_cache.size() > 15)
+      {
+        m_is_flying_cache.erase (m_is_flying_cache.begin());
+      }
+      bool was_flying = *std::max_element(m_is_flying_cache.begin(), m_is_flying_cache.end());
+      if(m_voltage_cache.size() > 5)
+      {
+        m_voltage_cache.erase(m_voltage_cache.begin());
+      }
+      float max_voltage = *std::max_element(m_voltage_cache.begin(), m_voltage_cache.end());
+      // ROS_INFO("aV %.3f (%.3f), mV %.3f %d => %.3f", voltage, m_voltage_cache[0], max_voltage, was_flying,  battery_level(max_voltage, was_flying));
+      m_battery_level = std::min(m_battery_level, battery_level(max_voltage, was_flying));
+  }
+
+  void onBatteryData(uint32_t time_in_ms, logBattery* data) {
     if (m_enable_logging_battery) {
-      std_msgs::Float32 msg;
-      // V
-      msg.data = data->pm_vbat;
+      sensor_msgs::BatteryState msg = sensor_msgs::BatteryState();
+      if (m_use_ros_time) {
+        msg.header.stamp = ros::Time::now();
+      } else {
+        msg.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      msg.voltage = data->battery_voltage;
+      msg.current = data->charge_current;
+      msg.design_capacity = 250;
+      update_voltage(data->battery_voltage, data->thrust, data->battery_level, data->battery_state);
+      msg.percentage = m_battery_level;   // TODO: check
+      switch (data->battery_state) {
+        case 0:
+          msg.power_supply_status = sensor_msgs::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
+          break;
+        case 1:
+          msg.power_supply_status = sensor_msgs::BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+          break;
+        case 2:
+          msg.power_supply_status = sensor_msgs::BatteryState::POWER_SUPPLY_STATUS_FULL;
+          break;
+        default:
+          msg.power_supply_status = sensor_msgs::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
+      }
+
+      msg.power_supply_technology = sensor_msgs::BatteryState::POWER_SUPPLY_TECHNOLOGY_LIPO;
+      msg.present = true;  // TODO: check
       m_pubBattery.publish(msg);
+    }
+  }
+
+  void onOrientationData(uint32_t time_in_ms, logOrientation* data) {
+    if (m_enable_logging_odom) {
+      m_odom.pose.pose.orientation.x = data->qx;
+      m_odom.pose.pose.orientation.y = data->qy;
+      m_odom.pose.pose.orientation.z = data->qz;
+      m_odom.pose.pose.orientation.w = data->qw;
+    }
+  }
+
+  void onOdomData(uint32_t time_in_ms, logOdom* data) {
+    if (m_enable_logging_state) {
+      if (m_use_ros_time) {
+        m_odom.header.stamp = ros::Time::now();
+      } else {
+        m_odom.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      m_odom.pose.pose.position.x = data->x;
+      m_odom.pose.pose.position.y = data->y;
+      m_odom.pose.pose.position.z = data->z;
+      m_odom.twist.twist.linear.x = data->vx;
+      m_odom.twist.twist.linear.y = data->vy;
+      m_odom.twist.twist.linear.z = data->vz;
+      m_pubOdom.publish(m_odom);
+
+      tf::Transform transform;
+
+      transform.setOrigin(tf::Vector3(data->x, data->y, data->z));
+      transform.setRotation(tf::Quaternion(m_odom.pose.pose.orientation.x, m_odom.pose.pose.orientation.y, m_odom.pose.pose.orientation.z, m_odom.pose.pose.orientation.w));
+
+      m_tf_broadcaster.sendTransform(tf::StampedTransform(transform, m_odom.header.stamp, m_odom.header.frame_id, m_odom.child_frame_id));
+
+    }
+  }
+
+  void onStateData(uint32_t time_in_ms, logState* data) {
+    if (m_enable_logging_odom) {
+      crazyflie_driver::FlightState msg;
+      if (m_use_ros_time) {
+        msg.header.stamp = ros::Time::now();
+      } else {
+        msg.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      msg.can_fly = data->can_fly;
+      msg.flying = data->flying;
+      msg.thrust = data->thrust;
+      msg.battery_low = data->battery_state == 3;
+      m_pubState.publish(msg);
     }
   }
 
@@ -832,6 +1060,8 @@ private:
   bool m_enable_logging_pressure;
   bool m_enable_logging_battery;
   bool m_enable_logging_packets;
+  bool m_enable_logging_odom;
+  bool m_enable_logging_state;
 
   ros::ServiceServer m_serviceEmergency;
   ros::ServiceServer m_serviceUpdateParams;
@@ -858,12 +1088,20 @@ private:
   ros::Publisher m_pubBattery;
   ros::Publisher m_pubPackets;
   ros::Publisher m_pubRssi;
+  ros::Publisher m_pubOdom;
+  ros::Publisher m_pubState;
+  tf::TransformBroadcaster m_tf_broadcaster;
+  nav_msgs::Odometry m_odom;
   std::vector<ros::Publisher> m_pubLogDataGeneric;
 
   bool m_sentSetpoint, m_sentExternalPosition;
 
   std::thread m_thread;
   ros::CallbackQueue m_callback_queue;
+
+  std::vector<bool> m_is_flying_cache;
+  std::vector<float> m_voltage_cache;
+  float m_battery_level;
 };
 
 class CrazyflieServer
@@ -932,7 +1170,9 @@ private:
       req.enable_logging_magnetic_field,
       req.enable_logging_pressure,
       req.enable_logging_battery,
-      req.enable_logging_packets);
+      req.enable_logging_packets,
+      req.enable_logging_odom,
+      req.enable_logging_state);
 
     while(cf->state == initializing)
     {
