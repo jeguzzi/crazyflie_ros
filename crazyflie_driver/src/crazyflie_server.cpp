@@ -87,6 +87,7 @@ class CrazyflieROS
 public:
   CrazyflieROS(
     const std::string& link_uri,
+    int8_t crazyradio_tx_power,
     const std::string& tf_prefix,
     float roll_trim,
     float pitch_trim,
@@ -102,7 +103,7 @@ public:
     bool enable_logging_packets,
     bool enable_logging_odom,
     bool enable_logging_state)
-    : m_cf(link_uri, rosLogger)
+    : m_cf(link_uri, rosLogger, crazyradio_tx_power)
     , m_tf_prefix(tf_prefix)
     , m_isEmergency(false)
     , m_roll_trim(roll_trim)
@@ -1160,6 +1161,7 @@ private:
 
     CrazyflieROS* cf = new CrazyflieROS(
       req.uri,
+      req.crazyradio_tx_power,
       req.tf_prefix,
       req.roll_trim,
       req.pitch_trim,

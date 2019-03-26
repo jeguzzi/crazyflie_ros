@@ -1,4 +1,5 @@
 string uri
+int8 crazyradio_tx_power
 string tf_prefix
 float32 roll_trim
 float32 pitch_trim
