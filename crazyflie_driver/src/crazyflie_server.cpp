@@ -1,6 +1,8 @@
 #include <ros/ros.h>
 #include <ros/callback_queue.h>
 
+#include <math.h>
+
 #include "crazyflie_driver/AddCrazyflie.h"
 #include "crazyflie_driver/GoTo.h"
 #include "crazyflie_driver/Land.h"
@@ -25,6 +27,8 @@
 #include "std_msgs/Empty.h"
 #include "geometry_msgs/Twist.h"
 #include "geometry_msgs/PointStamped.h"
+#include "geometry_msgs/Quaternion.h"
+#include "geometry_msgs/Point.h"
 #include "sensor_msgs/Imu.h"
 #include "sensor_msgs/Temperature.h"
 #include "sensor_msgs/MagneticField.h"
@@ -50,6 +54,17 @@ double degToRad(double deg) {
 
 double radToDeg(double rad) {
     return rad * 180.0 / pi();
+}
+
+// A simplified test to avoid using garbage tf data
+bool quaterionIsValid(const geometry_msgs::Quaternion& quaterion)
+{
+  return !(quaterion.x==0 || quaterion.y==0 || quaterion.z==0 || quaterion.w==0);
+}
+
+bool positionIsValid(const geometry_msgs::Point& position)
+{
+  return !(isnan(position.x) || isnan(position.y) || isnan(position.z));
 }
 
 enum RunningState { initializing, running, exception};
@@ -890,6 +905,8 @@ void cmdPositionSetpoint(
     }
   }
 
+
+
   void onOdomData(uint32_t time_in_ms, logOdom* data) {
     if (m_enable_logging_state) {
       if (m_use_ros_time) {
@@ -903,15 +920,23 @@ void cmdPositionSetpoint(
       m_odom.twist.twist.linear.x = data->vx;
       m_odom.twist.twist.linear.y = data->vy;
       m_odom.twist.twist.linear.z = data->vz;
-      m_pubOdom.publish(m_odom);
 
+      if (!(quaterionIsValid(m_odom.pose.pose.orientation) &&
+            positionIsValid(m_odom.pose.pose.position))) {
+          ROS_WARN("Odometry data is not valid: do not publish");
+      }
+
+      m_pubOdom.publish(m_odom);
       tf::Transform transform;
 
       transform.setOrigin(tf::Vector3(data->x, data->y, data->z));
-      transform.setRotation(tf::Quaternion(m_odom.pose.pose.orientation.x, m_odom.pose.pose.orientation.y, m_odom.pose.pose.orientation.z, m_odom.pose.pose.orientation.w));
 
-      m_tf_broadcaster.sendTransform(tf::StampedTransform(transform, m_odom.header.stamp, m_odom.header.frame_id, m_odom.child_frame_id));
-
+      transform.setRotation(tf::Quaternion(m_odom.pose.pose.orientation.x,
+            m_odom.pose.pose.orientation.y, m_odom.pose.pose.orientation.z,
+            m_odom.pose.pose.orientation.w));
+      m_tf_broadcaster.sendTransform(
+        tf::StampedTransform(transform, m_odom.header.stamp, m_odom.header.frame_id,
+                             m_odom.child_frame_id));
     }
   }
 
