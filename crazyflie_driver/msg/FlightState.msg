@@ -1,5 +1,5 @@
 Header header
 bool can_fly
 bool flying
-uint16 thrust
+float32 thrust
 bool battery_low
