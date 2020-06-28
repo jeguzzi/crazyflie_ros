@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<robot name="crazyflie_with_camera" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="crazyflie2.base.urdf.xacro"/>
+
+  <xacro:property name="camera_x" value="0.027" />
+  <xacro:property name="camera_z" value="0.023" />
+
+  <xacro:crazyflie2/>
+
+  <link name="${tf_prefix}camera_link"/>
+
+  <link name="${tf_prefix}camera_optical_link"/>
+
+  <joint name="${tf_prefix}camera_joint" type="fixed">
+    <origin xyz="${camera_x} 0 ${camera_z}" rpy="0 0 0" />
+    <parent link="${tf_prefix}base_link"/>
+    <child link="${tf_prefix}camera_link" />
+  </joint>
+
+  <joint name="${tf_prefix}camera_optical_join" type="fixed">
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+    <!-- <axis xyz="0 0 1" /> -->
+    <parent link="${tf_prefix}camera_link" />
+    <child link="${tf_prefix}camera_optical_link" />
+  </joint>
+
+
+</robot>

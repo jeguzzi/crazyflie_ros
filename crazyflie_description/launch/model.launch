@@ -1,0 +1,13 @@
+<launch>
+  <arg name="name" default=""/>
+  <arg name="camera" default="false"/>
+  <group ns="$(eval arg('name') or '/')">
+    <param name="robot_description"
+      command="$(find xacro)/xacro --inorder $(find crazyflie_description)/urdf/crazyflie2.urdf.xacro
+               name:=$(arg name)" unless="$(arg camera)"/>
+    <param name="robot_description"
+     command="$(find xacro)/xacro --inorder $(find crazyflie_description)/urdf/crazyflie2_with_camera.urdf.xacro
+              name:=$(arg name)" if="$(arg camera)"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+  </group>
+</launch>
