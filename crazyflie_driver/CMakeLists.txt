@@ -33,6 +33,7 @@ add_service_files(
   AddCrazyflie.srv
   GoTo.srv
   Land.srv
+  NotifySetpointsStop.srv
   RemoveCrazyflie.srv
   SetGroupMask.srv
   StartTrajectory.srv
@@ -48,6 +49,7 @@ add_message_files(
   LogBlock.msg
   GenericLogData.msg
   FullState.msg
+  VelocityWorld.msg
   TrajectoryPolynomialPiece.msg
   crtpPacket.msg
   Hover.msg

@@ -20,6 +20,7 @@ int main(int argc, char **argv)
   bool enable_logging_magnetic_field;
   bool enable_logging_pressure;
   bool enable_logging_battery;
+  bool enable_logging_pose;
   bool enable_logging_packets;
   bool enable_logging_odom;
   bool enable_logging_state;
@@ -38,6 +39,7 @@ int main(int argc, char **argv)
   n.param("enable_logging_magnetic_field", enable_logging_magnetic_field, true);
   n.param("enable_logging_pressure", enable_logging_pressure, true);
   n.param("enable_logging_battery", enable_logging_battery, true);
+  n.param("enable_logging_pose", enable_logging_pose, false);
   n.param("enable_logging_packets", enable_logging_packets, true);
   n.param("enable_logging_odom", enable_logging_odom, true);
   n.param("enable_logging_state", enable_logging_state, true);
@@ -61,6 +63,7 @@ int main(int argc, char **argv)
   addCrazyflie.request.enable_logging_magnetic_field = enable_logging_magnetic_field;
   addCrazyflie.request.enable_logging_pressure = enable_logging_pressure;
   addCrazyflie.request.enable_logging_battery = enable_logging_battery;
+  addCrazyflie.request.enable_logging_pose = enable_logging_pose;
   addCrazyflie.request.enable_logging_packets = enable_logging_packets;
   addCrazyflie.request.enable_logging_odom = enable_logging_odom;
   addCrazyflie.request.enable_logging_state = enable_logging_state;

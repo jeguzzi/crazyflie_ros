@@ -6,6 +6,7 @@
 #include "crazyflie_driver/AddCrazyflie.h"
 #include "crazyflie_driver/GoTo.h"
 #include "crazyflie_driver/Land.h"
+#include "crazyflie_driver/NotifySetpointsStop.h"
 #include "crazyflie_driver/RemoveCrazyflie.h"
 #include "crazyflie_driver/SetGroupMask.h"
 #include "crazyflie_driver/StartTrajectory.h"
@@ -20,6 +21,7 @@
 #include "crazyflie_driver/FullState.h"
 #include "crazyflie_driver/Hover.h"
 #include "crazyflie_driver/Position.h"
+#include "crazyflie_driver/VelocityWorld.h"
 #include "crazyflie_driver/crtpPacket.h"
 #include "crazyflie_cpp/Crazyradio.h"
 #include "crazyflie_cpp/crtp.h"
@@ -29,6 +31,7 @@
 #include "geometry_msgs/PointStamped.h"
 #include "geometry_msgs/Quaternion.h"
 #include "geometry_msgs/Point.h"
+#include "geometry_msgs/PoseStamped.h"
 #include "sensor_msgs/Imu.h"
 #include "sensor_msgs/Temperature.h"
 #include "sensor_msgs/MagneticField.h"
@@ -102,6 +105,9 @@ static ROSLogger rosLogger;
 class CrazyflieROS
 {
 public:
+
+  RunningState state;
+
   CrazyflieROS(
     const std::string& link_uri,
     int8_t crazyradio_tx_power,
@@ -118,12 +124,17 @@ public:
     bool enable_logging_pressure,
     bool enable_logging_battery,
     bool enable_logging_packets,
+    bool enable_logging_pose,
     bool enable_logging_odom,
     bool enable_logging_state,
     bool enable_logging_front_net,
     std::string front_net_frame = std::string("base_link"))
-    : m_cf(link_uri, rosLogger, crazyradio_tx_power)
-    , m_tf_prefix(tf_prefix)
+    : m_tf_prefix(tf_prefix)
+    , m_cf(
+      link_uri,
+      rosLogger,
+      std::bind(&CrazyflieROS::onConsole, this, std::placeholders::_1),
+      crazyradio_tx_power)
     , m_isEmergency(false)
     , m_roll_trim(roll_trim)
     , m_pitch_trim(pitch_trim)
@@ -136,6 +147,7 @@ public:
     , m_enable_logging_magnetic_field(enable_logging_magnetic_field)
     , m_enable_logging_pressure(enable_logging_pressure)
     , m_enable_logging_battery(enable_logging_battery)
+    , m_enable_logging_pose(enable_logging_pose)
     , m_enable_logging_packets(enable_logging_packets)
     , m_enable_logging_odom(enable_logging_odom)
     , m_enable_logging_state(enable_logging_state)
@@ -149,8 +161,11 @@ public:
     , m_serviceGoTo()
     , m_serviceUploadTrajectory()
     , m_serviceStartTrajectory()
+    , m_serviceNotifySetpointsStop()
+    , m_sendPacketServer()
     , m_subscribeCmdVel()
     , m_subscribeCmdFullState()
+    , m_subscribeCmdVelocityWorld()
     , m_subscribeCmdHover()
     , m_subscribeCmdStop()
     , m_subscribeCmdPosition()
@@ -169,57 +184,24 @@ public:
     , m_sentExternalPosition(false)
     , m_is_flying_cache()
     , m_voltage_cache()
-    , m_battery_level(1.0),
-    publish_stabilized_tf(true),
-    front_net_frame(tf_prefix + '/' + front_net_frame)
+    , m_battery_level(1.0)
+    , publish_stabilized_tf(true)
+    , front_net_frame(tf_prefix + '/' + front_net_frame)
   {
     state = initializing;
     m_thread = std::thread(&CrazyflieROS::run_safe, this);
   }
 
-  RunningState state;
-
   ~CrazyflieROS()
   {
-    if(m_serviceEmergency) m_serviceEmergency.shutdown();
-    if(m_serviceUpdateParams) m_serviceUpdateParams.shutdown();
-    if(m_serviceSetGroupMask) m_serviceSetGroupMask.shutdown();
-    if(m_serviceTakeoff) m_serviceTakeoff.shutdown();
-    if(m_serviceLand) m_serviceLand.shutdown();
-    if(m_serviceStop) m_serviceStop.shutdown();
-    if(m_serviceGoTo) m_serviceGoTo.shutdown();
-    if(m_serviceUploadTrajectory) m_serviceUploadTrajectory.shutdown();
-    if(m_serviceStartTrajectory) m_serviceStartTrajectory.shutdown();
-    if(m_sendPacketServer) m_sendPacketServer.shutdown();
-    if(m_subscribeCmdVel) m_subscribeCmdVel.shutdown();
-    if(m_subscribeCmdFullState) m_subscribeCmdFullState.shutdown();
-    if(m_subscribeCmdHover) m_subscribeCmdHover.shutdown();
-    if(m_subscribeCmdStop) m_subscribeCmdStop.shutdown();
-    if(m_subscribeCmdPosition) m_subscribeCmdPosition.shutdown();
-    if(m_subscribeExternalPosition) m_subscribeExternalPosition.shutdown();
-    if(m_pubImu) m_pubImu.shutdown();
-    if(m_pubTemp) m_pubTemp.shutdown();
-    if(m_pubMag) m_pubMag.shutdown();
-    if(m_pubPressure) m_pubPressure.shutdown();
-    if(m_pubBattery) m_pubBattery.shutdown();
-    if(m_pubRssi) m_pubRssi.shutdown();
-    if(m_pubOdom) m_pubOdom.shutdown();
-    if(m_pubState) m_pubState.shutdown();
-    if(m_pubFrontNetPose)
-    {
-      m_pubFrontNetPose.shutdown();
-      m_pubFrontNetOutput.shutdown();
-    }
-    for (size_t i = 0; i < m_pubLogDataGeneric.size(); i++) {
-      m_pubLogDataGeneric[i].shutdown();
-    }
+    stop();
   }
 
   void stop()
   {
-    ROS_INFO("Disconnecting ...");
     m_isEmergency = true;
-    m_thread.join();
+    if(m_thread.joinable())
+      m_thread.join();
   }
 
   /**
@@ -241,32 +223,6 @@ public:
     }
     m_cf.queueOutgoingPacket(packet);
     return true;
-  }
-
-private:
-  ros::ServiceServer m_sendPacketServer;
-
-  /**
-   * Publishes any generic packets en-queued by the crazyflie to a crtpPacket
-   * topic.
-   */
-  void publishPackets() {
-    std::vector<Crazyradio::Ack> packets = m_cf.retrieveGenericPackets();
-    if (!packets.empty())
-    {
-      std::vector<Crazyradio::Ack>::iterator it;
-      for (it = packets.begin(); it != packets.end(); it++)
-      {
-        crazyflie_driver::crtpPacket packet;
-        packet.size = it->size;
-        packet.header = it->data[0];
-        for(int i = 0; i < packet.size; i++)
-        {
-          packet.data[i] = it->data[i+1];
-        }
-        m_pubPackets.publish(packet);
-      }
-    }
   }
 
 private:
@@ -327,70 +283,78 @@ private:
     uint32_t lastUpdate;
   } __attribute__((packed));
 
+  struct logPose {
+    float x;
+    float y;
+    float z;
+    int32_t quatCompressed;
+  } __attribute__((packed));
+
 private:
   bool emergency(
     std_srvs::Empty::Request& req,
     std_srvs::Empty::Response& res)
   {
-    ROS_FATAL("Emergency requested!");
+    ROS_FATAL_NAMED(m_tf_prefix, "Emergency requested!");
     m_isEmergency = true;
+    m_cf.emergencyStop();
 
     return true;
   }
 
   template<class T, class U>
-  void updateParam(uint8_t id, const std::string& ros_param) {
+  void updateParam(uint16_t id, const std::string& ros_param) {
       U value;
       ros::param::get(ros_param, value);
       m_cf.setParam<T>(id, (T)value);
   }
 
-void cmdHoverSetpoint(
-    const crazyflie_driver::Hover::ConstPtr& msg)
-  {
-     //ROS_INFO("got a hover setpoint");
-    if (!m_isEmergency) {
-      float vx = msg->vx;
-      float vy = msg->vy;
-      float yawRate = msg->yawrate;
-      float zDistance = msg->zDistance;
+  void cmdHoverSetpoint(
+      const crazyflie_driver::Hover::ConstPtr& msg)
+    {
+       //ROS_INFO("got a hover setpoint");
+      if (!m_isEmergency) {
+        float vx = msg->vx;
+        float vy = msg->vy;
+        float yawRate = msg->yawrate;
+        float zDistance = msg->zDistance;
 
-      m_cf.sendHoverSetpoint(vx, vy, yawRate, zDistance);
-      m_sentSetpoint = true;
-      //ROS_INFO("set a hover setpoint");
+        m_cf.sendHoverSetpoint(vx, vy, yawRate, zDistance);
+        m_sentSetpoint = true;
+        //ROS_INFO("set a hover setpoint");
+      }
     }
-  }
 
-void cmdStop(
-    const std_msgs::Empty::ConstPtr& msg)
-  {
-     //ROS_INFO("got a stop setpoint");
-    if (!m_isEmergency) {
-      m_cf.sendStop();
-      m_sentSetpoint = true;
-      //ROS_INFO("set a stop setpoint");
+  void cmdStop(
+      const std_msgs::Empty::ConstPtr& msg)
+    {
+       //ROS_INFO("got a stop setpoint");
+      if (!m_isEmergency) {
+        m_cf.sendStop();
+        m_sentSetpoint = true;
+        //ROS_INFO("set a stop setpoint");
+      }
     }
-  }
 
-void cmdPositionSetpoint(
-    const crazyflie_driver::Position::ConstPtr& msg)
-  {
-    if(!m_isEmergency) {
-      float x = msg->x;
-      float y = msg->y;
-      float z = msg->z;
-      float yaw = msg->yaw;
+  void cmdPositionSetpoint(
+      const crazyflie_driver::Position::ConstPtr& msg)
+    {
+      if(!m_isEmergency) {
+        float x = msg->x;
+        float y = msg->y;
+        float z = msg->z;
+        float yaw = msg->yaw;
 
-      m_cf.sendPositionSetpoint(x, y, z, yaw);
-      m_sentSetpoint = true;
+        m_cf.sendPositionSetpoint(x, y, z, yaw);
+        m_sentSetpoint = true;
+      }
     }
-  }
 
   bool updateParams(
     crazyflie_driver::UpdateParams::Request& req,
     crazyflie_driver::UpdateParams::Response& res)
   {
-    ROS_INFO("Update parameters");
+    ROS_INFO_NAMED(m_tf_prefix, "Update parameters");
     for (auto&& p : req.params) {
       std::string ros_param = "/" + m_tf_prefix + "/" + p;
       size_t pos = p.find("/");
@@ -425,7 +389,7 @@ void cmdPositionSetpoint(
         }
       }
       else {
-        ROS_ERROR("Could not find param %s/%s", group.c_str(), name.c_str());
+        ROS_ERROR_NAMED(m_tf_prefix, "Could not find param %s/%s", group.c_str(), name.c_str());
       }
     }
     return true;
@@ -479,6 +443,23 @@ void cmdPositionSetpoint(
     }
   }
 
+  void cmdVelocityWorldSetpoint(
+    const crazyflie_driver::VelocityWorld::ConstPtr& msg)
+  {
+    //ROS_INFO("got a velocity world setpoint");
+    if (!m_isEmergency) {
+      float x = msg->vel.x;
+      float y = msg->vel.y;
+      float z = msg->vel.z;
+      float yawRate = msg->yawRate;
+
+      m_cf.sendVelocityWorldSetpoint(
+        x, y, z, yawRate);
+      m_sentSetpoint = true;
+      //ROS_INFO("set a velocity world setpoint");
+    }
+  }
+
   void positionMeasurementChanged(
     const geometry_msgs::PointStamped::ConstPtr& msg)
   {
@@ -493,310 +474,346 @@ void cmdPositionSetpoint(
       run();
     }
     catch(std::exception& e) {
-        ROS_WARN("Exception %s while stopping CrazyflieROS ", e.what());
+        ROS_WARN("Exception %s while stopping run safe thread", e.what());
     }
+  }
+
+  void poseMeasurementChanged(
+    const geometry_msgs::PoseStamped::ConstPtr& msg)
+  {
+    m_cf.sendExternalPoseUpdate(
+    msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+    msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z, msg->pose.orientation.w);
+    m_sentExternalPosition = true;
   }
 
   void run()
   {
+    ros::NodeHandle n;
     try
     {
-    ros::NodeHandle n;
-    n.setCallbackQueue(&m_callback_queue);
+      n.setCallbackQueue(&m_callback_queue);
 
-    m_subscribeCmdVel = n.subscribe(m_tf_prefix + "/cmd_vel", 1, &CrazyflieROS::cmdVelChanged, this);
-    m_subscribeCmdFullState = n.subscribe(m_tf_prefix + "/cmd_full_state", 1, &CrazyflieROS::cmdFullStateSetpoint, this);
-    m_subscribeExternalPosition = n.subscribe(m_tf_prefix + "/external_position", 1, &CrazyflieROS::positionMeasurementChanged, this);
-    m_serviceEmergency = n.advertiseService(m_tf_prefix + "/emergency", &CrazyflieROS::emergency, this);
-    m_subscribeCmdHover = n.subscribe(m_tf_prefix + "/cmd_hover", 1, &CrazyflieROS::cmdHoverSetpoint, this);
-    m_subscribeCmdStop = n.subscribe(m_tf_prefix + "/cmd_stop", 1, &CrazyflieROS::cmdStop, this);
-    m_subscribeCmdPosition = n.subscribe(m_tf_prefix + "/cmd_position", 1, &CrazyflieROS::cmdPositionSetpoint, this);
-
-
-    m_serviceSetGroupMask = n.advertiseService(m_tf_prefix + "/set_group_mask", &CrazyflieROS::setGroupMask, this);
-    m_serviceTakeoff = n.advertiseService(m_tf_prefix + "/takeoff", &CrazyflieROS::takeoff, this);
-    m_serviceLand = n.advertiseService(m_tf_prefix + "/land", &CrazyflieROS::land, this);
-    m_serviceStop = n.advertiseService(m_tf_prefix + "/stop", &CrazyflieROS::stop, this);
-    m_serviceGoTo = n.advertiseService(m_tf_prefix + "/go_to", &CrazyflieROS::goTo, this);
-    m_serviceUploadTrajectory = n.advertiseService(m_tf_prefix + "/upload_trajectory", &CrazyflieROS::uploadTrajectory, this);
-    m_serviceStartTrajectory = n.advertiseService(m_tf_prefix + "/start_trajectory", &CrazyflieROS::startTrajectory, this);
-
-    if (m_enable_logging_imu) {
-      m_pubImu = n.advertise<sensor_msgs::Imu>(m_tf_prefix + "/imu", 10);
-    }
-    if (m_enable_logging_temperature) {
-      m_pubTemp = n.advertise<sensor_msgs::Temperature>(m_tf_prefix + "/temperature", 10);
-    }
-    if (m_enable_logging_magnetic_field) {
-      m_pubMag = n.advertise<sensor_msgs::MagneticField>(m_tf_prefix + "/magnetic_field", 10);
-    }
-    if (m_enable_logging_pressure) {
-      m_pubPressure = n.advertise<std_msgs::Float32>(m_tf_prefix + "/pressure", 10);
-    }
-    if (m_enable_logging_battery) {
-      m_pubBattery = n.advertise<sensor_msgs::BatteryState>(m_tf_prefix + "/battery", 10);
-    }
-    if (m_enable_logging_packets) {
-      m_pubPackets = n.advertise<crazyflie_driver::crtpPacket>(m_tf_prefix + "/packets", 10);
-    }
-    if (m_enable_logging_odom) {
-      m_pubOdom = n.advertise<nav_msgs::Odometry>(m_tf_prefix + "/odom", 1);
-      m_odom = nav_msgs::Odometry();
-      m_odom.header.frame_id = m_tf_prefix + "/odom";
-      m_odom.child_frame_id = m_tf_prefix + "/base_link";
-      m_odom.pose.covariance[0] = -1;
-      m_odom.twist.covariance[0] = -1;
-      m_odom.pose.pose.orientation.w = 1;
-      m_base_stabilized_frame_id = m_tf_prefix + "/base_stabilized";
-    }
-    if (m_enable_logging_state) {
-      m_pubState = n.advertise<crazyflie_driver::FlightState>(m_tf_prefix + "/state", 1);
-    }
-
-    if (m_enable_logging_front_net) {
-      m_pubFrontNetPose= n.advertise<geometry_msgs::PoseStamped>(m_tf_prefix + "/head", 1);
-      m_pubFrontNetOutput= n.advertise<std_msgs::Float32MultiArray>(m_tf_prefix + "/output", 1);
-    }
-
-    m_pubRssi = n.advertise<std_msgs::Float32>(m_tf_prefix + "/rssi", 10);
-
-    for (auto& logBlock : m_logBlocks)
-    {
-      m_pubLogDataGeneric.push_back(n.advertise<crazyflie_driver::GenericLogData>(m_tf_prefix + "/" + logBlock.topic_name, 10));
-    }
-
-    m_sendPacketServer = n.advertiseService(m_tf_prefix + "/send_packet"  , &CrazyflieROS::sendPacket, this);
-
-    // m_cf.reboot();
-
-    auto start = std::chrono::system_clock::now();
-
-    std::function<void(const char*)> cb_console = std::bind(&CrazyflieROS::onConsole, this, std::placeholders::_1);
-    m_cf.setConsoleCallback(cb_console);
-
-    m_cf.logReset();
-
-    std::function<void(float)> cb_lq = std::bind(&CrazyflieROS::onLinkQuality, this, std::placeholders::_1);
-    m_cf.setLinkQualityCallback(cb_lq);
-
-
-
-    if (m_enableParameters)
-    {
-      ROS_INFO("Requesting parameters...");
-      m_cf.requestParamToc();
-      for (auto iter = m_cf.paramsBegin(); iter != m_cf.paramsEnd(); ++iter) {
-        auto entry = *iter;
-        std::string paramName = "/" + m_tf_prefix + "/" + entry.group + "/" + entry.name;
-        switch (entry.type) {
-          case Crazyflie::ParamTypeUint8:
-            ros::param::set(paramName, m_cf.getParam<uint8_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeInt8:
-            ros::param::set(paramName, m_cf.getParam<int8_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeUint16:
-            ros::param::set(paramName, m_cf.getParam<uint16_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeInt16:
-            ros::param::set(paramName, m_cf.getParam<int16_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeUint32:
-            ros::param::set(paramName, (int)m_cf.getParam<uint32_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeInt32:
-            ros::param::set(paramName, m_cf.getParam<int32_t>(entry.id));
-            break;
-          case Crazyflie::ParamTypeFloat:
-            ros::param::set(paramName, m_cf.getParam<float>(entry.id));
-            break;
-        }
-      }
-      m_serviceUpdateParams = n.advertiseService(m_tf_prefix + "/update_params", &CrazyflieROS::updateParams, this);
-    }
-
-    std::unique_ptr<LogBlock<logImu> > logBlockImu;
-    std::unique_ptr<LogBlock<log2> > logBlock2;
-    std::unique_ptr<LogBlock<logOdom> > logBlockOdom;
-    std::unique_ptr<LogBlock<logOrientation> > logBlockOrientation;
-    std::unique_ptr<LogBlock<logState> > logBlockState;
-    std::unique_ptr<LogBlock<logBattery> > logBlockBattery;
-    std::unique_ptr<LogBlock<logFrontNet> > logBlockFrontNet;
-
-    std::vector<std::unique_ptr<LogBlockGeneric> > logBlocksGeneric(m_logBlocks.size());
-    if (m_enableLogging) {
-
-      std::function<void(const crtpPlatformRSSIAck*)> cb_ack = std::bind(&CrazyflieROS::onEmptyAck, this, std::placeholders::_1);
-      m_cf.setEmptyAckCallback(cb_ack);
-
-      ROS_INFO("Requesting Logging variables...");
-      m_cf.requestLogToc();
+      m_subscribeCmdVel = n.subscribe(m_tf_prefix + "/cmd_vel", 1, &CrazyflieROS::cmdVelChanged, this);
+      m_subscribeCmdFullState = n.subscribe(m_tf_prefix + "/cmd_full_state", 1, &CrazyflieROS::cmdFullStateSetpoint, this);
+      m_subscribeCmdVelocityWorld = n.subscribe(m_tf_prefix+"/cmd_velocity_world", 1, &CrazyflieROS::cmdVelocityWorldSetpoint, this);
+      m_subscribeExternalPosition = n.subscribe(m_tf_prefix + "/external_position", 1, &CrazyflieROS::positionMeasurementChanged, this);
+      m_subscribeExternalPose = n.subscribe(m_tf_prefix + "/external_pose", 1, &CrazyflieROS::poseMeasurementChanged, this);
+      m_serviceEmergency = n.advertiseService(m_tf_prefix + "/emergency", &CrazyflieROS::emergency, this);
+      m_subscribeCmdHover = n.subscribe(m_tf_prefix + "/cmd_hover", 1, &CrazyflieROS::cmdHoverSetpoint, this);
+      m_subscribeCmdStop = n.subscribe(m_tf_prefix + "/cmd_stop", 1, &CrazyflieROS::cmdStop, this);
+      m_subscribeCmdPosition = n.subscribe(m_tf_prefix + "/cmd_position", 1, &CrazyflieROS::cmdPositionSetpoint, this);
+      m_serviceSetGroupMask = n.advertiseService(m_tf_prefix + "/set_group_mask", &CrazyflieROS::setGroupMask, this);
+      m_serviceTakeoff = n.advertiseService(m_tf_prefix + "/takeoff", &CrazyflieROS::takeoff, this);
+      m_serviceLand = n.advertiseService(m_tf_prefix + "/land", &CrazyflieROS::land, this);
+      m_serviceStop = n.advertiseService(m_tf_prefix + "/stop", &CrazyflieROS::stop, this);
+      m_serviceGoTo = n.advertiseService(m_tf_prefix + "/go_to", &CrazyflieROS::goTo, this);
+      m_serviceUploadTrajectory = n.advertiseService(m_tf_prefix + "/upload_trajectory", &CrazyflieROS::uploadTrajectory, this);
+      m_serviceStartTrajectory = n.advertiseService(m_tf_prefix + "/start_trajectory", &CrazyflieROS::startTrajectory, this);
+      m_serviceNotifySetpointsStop = n.advertiseService(m_tf_prefix + "/notify_setpoints_stop", &CrazyflieROS::notifySetpointsStop, this);
 
       if (m_enable_logging_imu) {
-        std::function<void(uint32_t, logImu*)> cb = std::bind(&CrazyflieROS::onImuData, this, std::placeholders::_1, std::placeholders::_2);
-
-        logBlockImu.reset(new LogBlock<logImu>(
-          &m_cf,{
-            {"acc", "x"},
-            {"acc", "y"},
-            {"acc", "z"},
-            {"gyro", "x"},
-            {"gyro", "y"},
-            {"gyro", "z"},
-          }, cb));
-        logBlockImu->start(1); // 10ms
+        m_pubImu = n.advertise<sensor_msgs::Imu>(m_tf_prefix + "/imu", 10);
+      }
+      if (m_enable_logging_temperature) {
+        m_pubTemp = n.advertise<sensor_msgs::Temperature>(m_tf_prefix + "/temperature", 10);
+      }
+      if (m_enable_logging_magnetic_field) {
+        m_pubMag = n.advertise<sensor_msgs::MagneticField>(m_tf_prefix + "/magnetic_field", 10);
+      }
+      if (m_enable_logging_pressure) {
+        m_pubPressure = n.advertise<std_msgs::Float32>(m_tf_prefix + "/pressure", 10);
+      }
+      if (m_enable_logging_battery) {
+        m_pubBattery = n.advertise<sensor_msgs::BatteryState>(m_tf_prefix + "/battery", 10);
+      }
+      if (m_enable_logging_pose) {
+        m_pubPose = n.advertise<geometry_msgs::PoseStamped>(m_tf_prefix + "/pose", 10);
+      }
+      if (m_enable_logging_packets) {
+        m_pubPackets = n.advertise<crazyflie_driver::crtpPacket>(m_tf_prefix + "/packets", 10);
+        std::function<void(const ITransport::Ack&)> cb_genericPacket = std::bind(&CrazyflieROS::onGenericPacket, this, std::placeholders::_1);
+        m_cf.setGenericPacketCallback(cb_genericPacket);
+      }
+      if (m_enable_logging_odom) {
+        m_pubOdom = n.advertise<nav_msgs::Odometry>(m_tf_prefix + "/odom", 1);
+        m_odom = nav_msgs::Odometry();
+        m_odom.header.frame_id = m_tf_prefix + "/odom";
+        m_odom.child_frame_id = m_tf_prefix + "/base_link";
+        m_odom.pose.covariance[0] = -1;
+        m_odom.twist.covariance[0] = -1;
+        m_odom.pose.pose.orientation.w = 1;
+        m_base_stabilized_frame_id = m_tf_prefix + "/base_stabilized";
+      }
+      if (m_enable_logging_state) {
+        m_pubState = n.advertise<crazyflie_driver::FlightState>(m_tf_prefix + "/state", 1);
       }
 
-      if (   m_enable_logging_temperature
-          || m_enable_logging_magnetic_field
-          || m_enable_logging_pressure)
-      {
-        std::function<void(uint32_t, log2*)> cb2 = std::bind(&CrazyflieROS::onLog2Data, this, std::placeholders::_1, std::placeholders::_2);
-
-        logBlock2.reset(new LogBlock<log2>(
-          &m_cf,{
-            {"mag", "x"},
-            {"mag", "y"},
-            {"mag", "z"},
-            {"baro", "temp"},
-            {"baro", "pressure"},
-            {"pm", "vbat"},
-          }, cb2));
-        logBlock2->start(10); // 100ms
+      if (m_enable_logging_front_net) {
+        m_pubFrontNetPose= n.advertise<geometry_msgs::PoseStamped>(m_tf_prefix + "/head", 1);
+        m_pubFrontNetOutput= n.advertise<std_msgs::Float32MultiArray>(m_tf_prefix + "/output", 1);
       }
 
-      if ( m_enable_logging_battery )
-      {
-        std::function<void(uint32_t, logBattery*)> cbb = std::bind(&CrazyflieROS::onBatteryData, this, std::placeholders::_1, std::placeholders::_2);
-        logBlockBattery.reset(new LogBlock<logBattery>(
-          &m_cf,{
-            {"pm", "vbat"},
-            {"pm", "chargeCurrent"},
-            {"pm", "state"},
-            {"pm", "batteryLevel"},
-            {"stabilizer", "thrust"}
-          }, cbb));
-        logBlockBattery->start(100); // 1000ms
-      }
+      m_pubRssi = n.advertise<std_msgs::Float32>(m_tf_prefix + "/rssi", 10);
 
-      if ( m_enable_logging_front_net )
-      {
-        std::function<void(uint32_t, logFrontNet*)> cbfn = std::bind(&CrazyflieROS::onFrontNetData, this, std::placeholders::_1, std::placeholders::_2);
-        logBlockFrontNet.reset(new LogBlock<logFrontNet>(
-          &m_cf,{
-            {"frontnet", "x"},
-            {"frontnet", "y"},
-            {"frontnet", "z"},
-            {"frontnet", "phi"},
-            {"frontnet", "lastUpdate"},
-          }, cbfn));
-        logBlockFrontNet->start(5); // 50ms
-      }
-
-      if (m_enable_logging_odom)
-      {
-        std::function<void(uint32_t, logOrientation*)> cb4 = std::bind(&CrazyflieROS::onOrientationData, this, std::placeholders::_1, std::placeholders::_2);
-        logBlockOrientation.reset(new LogBlock<logOrientation>(
-          &m_cf,{
-            {"stateEstimate", "qx"},
-            {"stateEstimate", "qy"},
-            {"stateEstimate", "qz"},
-            {"stateEstimate", "qw"}
-          }, cb4));
-        logBlockOrientation->start(5); // 50ms
-
-        std::function<void(uint32_t, logOdom*)> cb3 = std::bind(&CrazyflieROS::onOdomData, this, std::placeholders::_1, std::placeholders::_2);
-        logBlockOdom.reset(new LogBlock<logOdom>(
-          &m_cf,{
-            {"stateEstimate", "x"},
-            {"stateEstimate", "y"},
-            {"stateEstimate", "z"},
-            {"stateEstimate", "vx"},
-            {"stateEstimate", "vy"},
-            {"stateEstimate", "vz"},
-          }, cb3));
-        logBlockOdom->start(5); // 50ms
-      }
-
-      if (m_enable_logging_state)
-      {
-        std::function<void(uint32_t, logState*)> cb5 = std::bind(&CrazyflieROS::onStateData, this, std::placeholders::_1, std::placeholders::_2);
-        logBlockState.reset(new LogBlock<logState>(
-          &m_cf,{
-            {"kalman", "inFlight"},
-            {"sys", "canfly"},
-            {"stabilizer", "thrust"},
-            {"pm", "state"},
-          }, cb5));
-        logBlockState->start(50); // 500ms
-      }
-
-      // custom log blocks
-      size_t i = 0;
       for (auto& logBlock : m_logBlocks)
       {
-        std::function<void(uint32_t, std::vector<double>*, void* userData)> cb =
-          std::bind(
-            &CrazyflieROS::onLogCustom,
-            this,
-            std::placeholders::_1,
-            std::placeholders::_2,
-            std::placeholders::_3);
-
-        logBlocksGeneric[i].reset(new LogBlockGeneric(
-          &m_cf,
-          logBlock.variables,
-          (void*)&m_pubLogDataGeneric[i],
-          cb));
-        logBlocksGeneric[i]->start(logBlock.frequency / 10);
-        ++i;
+        m_pubLogDataGeneric.push_back(n.advertise<crazyflie_driver::GenericLogData>(m_tf_prefix + "/" + logBlock.topic_name, 10));
       }
-    }
 
-    ROS_INFO("Requesting memories...");
-    m_cf.requestMemoryToc();
+      m_sendPacketServer = n.advertiseService(m_tf_prefix + "/send_packet"  , &CrazyflieROS::sendPacket, this);
 
-    ROS_INFO("Ready...");
-    auto end = std::chrono::system_clock::now();
-    std::chrono::duration<double> elapsedSeconds = end-start;
-    ROS_INFO("Elapsed: %f s", elapsedSeconds.count());
+      // m_cf.reboot();
 
-    state = running;
+      auto start = std::chrono::system_clock::now();
 
-    // Send 0 thrust initially for thrust-lock
-    for (int i = 0; i < 100; ++i) {
-       m_cf.sendSetpoint(0, 0, 0, 0);
-    }
 
-    while(!m_isEmergency) {
-      // make sure we ping often enough to stream data out
-      if (m_enableLogging && !m_sentSetpoint && !m_sentExternalPosition) {
-        m_cf.transmitPackets();
-        m_cf.sendPing();
-        if(m_enable_logging_packets) {
-          this->publishPackets();
+      m_cf.logReset();
+      std::function<void(float)> cb_lq = std::bind(&CrazyflieROS::onLinkQuality, this, std::placeholders::_1);
+      m_cf.setLinkQualityCallback(cb_lq);
+
+      if (m_enableParameters)
+      {
+        ROS_INFO_NAMED(m_tf_prefix, "Requesting parameters...");
+        m_cf.requestParamToc();
+        for (auto iter = m_cf.paramsBegin(); iter != m_cf.paramsEnd(); ++iter) {
+          auto entry = *iter;
+          std::string paramName = "/" + m_tf_prefix + "/" + entry.group + "/" + entry.name;
+          switch (entry.type) {
+            case Crazyflie::ParamTypeUint8:
+              ros::param::set(paramName, m_cf.getParam<uint8_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeInt8:
+              ros::param::set(paramName, m_cf.getParam<int8_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeUint16:
+              ros::param::set(paramName, m_cf.getParam<uint16_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeInt16:
+              ros::param::set(paramName, m_cf.getParam<int16_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeUint32:
+              ros::param::set(paramName, (int)m_cf.getParam<uint32_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeInt32:
+              ros::param::set(paramName, m_cf.getParam<int32_t>(entry.id));
+              break;
+            case Crazyflie::ParamTypeFloat:
+              ros::param::set(paramName, m_cf.getParam<float>(entry.id));
+              break;
+          }
+        }
+        m_serviceUpdateParams = n.advertiseService(m_tf_prefix + "/update_params", &CrazyflieROS::updateParams, this);
+      }
+
+
+      std::unique_ptr<LogBlock<logImu> > logBlockImu;
+      std::unique_ptr<LogBlock<log2> > logBlock2;
+      std::unique_ptr<LogBlock<logOdom> > logBlockOdom;
+      std::unique_ptr<LogBlock<logOrientation> > logBlockOrientation;
+      std::unique_ptr<LogBlock<logState> > logBlockState;
+      std::unique_ptr<LogBlock<logBattery> > logBlockBattery;
+      std::unique_ptr<LogBlock<logFrontNet> > logBlockFrontNet;
+      std::unique_ptr<LogBlock<logPose> > logBlockPose;
+
+      std::vector<std::unique_ptr<LogBlockGeneric> > logBlocksGeneric(m_logBlocks.size());
+      if (m_enableLogging) {
+
+        std::function<void(const crtpPlatformRSSIAck*)> cb_ack = std::bind(&CrazyflieROS::onEmptyAck, this, std::placeholders::_1);
+        m_cf.setEmptyAckCallback(cb_ack);
+
+        ROS_INFO_NAMED(m_tf_prefix, "Requesting Logging variables...");
+        m_cf.requestLogToc();
+
+        if (m_enable_logging_imu) {
+          ROS_INFO("Will log IMU");
+          std::function<void(uint32_t, logImu*)> cb = std::bind(&CrazyflieROS::onImuData, this, std::placeholders::_1, std::placeholders::_2);
+
+          logBlockImu.reset(new LogBlock<logImu>(
+            &m_cf,{
+              {"acc", "x"},
+              {"acc", "y"},
+              {"acc", "z"},
+              {"gyro", "x"},
+              {"gyro", "y"},
+              {"gyro", "z"},
+            }, cb));
+          logBlockImu->start(1); // 10ms
+        }
+
+        if (   m_enable_logging_temperature
+            || m_enable_logging_magnetic_field
+            || m_enable_logging_pressure)
+        {
+          ROS_INFO("Will log magnetometer and barometer");
+          std::function<void(uint32_t, log2*)> cb2 = std::bind(&CrazyflieROS::onLog2Data, this, std::placeholders::_1, std::placeholders::_2);
+
+          logBlock2.reset(new LogBlock<log2>(
+            &m_cf,{
+              {"mag", "x"},
+              {"mag", "y"},
+              {"mag", "z"},
+              {"baro", "temp"},
+              {"baro", "pressure"},
+              {"pm", "vbat"},
+            }, cb2));
+          logBlock2->start(10); // 100ms
+        }
+
+        if ( m_enable_logging_battery )
+        {
+          ROS_INFO("Will log battery");
+          std::function<void(uint32_t, logBattery*)> cbb = std::bind(&CrazyflieROS::onBatteryData, this, std::placeholders::_1, std::placeholders::_2);
+          logBlockBattery.reset(new LogBlock<logBattery>(
+            &m_cf,{
+              {"pm", "vbat"},
+              {"pm", "chargeCurrent"},
+              {"pm", "state"},
+              {"pm", "batteryLevel"},
+              {"stabilizer", "thrust"}
+            }, cbb));
+          logBlockBattery->start(100); // 1000ms
+        }
+
+        if ( m_enable_logging_front_net )
+        {
+          ROS_INFO("Will log frontnet");
+          std::function<void(uint32_t, logFrontNet*)> cbfn = std::bind(&CrazyflieROS::onFrontNetData, this, std::placeholders::_1, std::placeholders::_2);
+          logBlockFrontNet.reset(new LogBlock<logFrontNet>(
+            &m_cf,{
+              {"frontnet", "x"},
+              {"frontnet", "y"},
+              {"frontnet", "z"},
+              {"frontnet", "phi"},
+              {"frontnet", "lastUpdate"},
+            }, cbfn));
+          logBlockFrontNet->start(5); // 50ms
+        }
+
+        if (m_enable_logging_odom)
+        {
+          ROS_INFO("Will log velocity");
+          std::function<void(uint32_t, logOrientation*)> cb4 = std::bind(&CrazyflieROS::onOrientationData, this, std::placeholders::_1, std::placeholders::_2);
+          logBlockOrientation.reset(new LogBlock<logOrientation>(
+            &m_cf,{
+              {"stateEstimate", "qx"},
+              {"stateEstimate", "qy"},
+              {"stateEstimate", "qz"},
+              {"stateEstimate", "qw"}
+            }, cb4));
+          logBlockOrientation->start(5); // 50ms
+
+          ROS_INFO("Will log position");
+
+          std::function<void(uint32_t, logOdom*)> cb3 = std::bind(&CrazyflieROS::onOdomData, this, std::placeholders::_1, std::placeholders::_2);
+          logBlockOdom.reset(new LogBlock<logOdom>(
+            &m_cf,{
+              {"stateEstimate", "x"},
+              {"stateEstimate", "y"},
+              {"stateEstimate", "z"},
+              {"stateEstimate", "vx"},
+              {"stateEstimate", "vy"},
+              {"stateEstimate", "vz"},
+            }, cb3));
+          logBlockOdom->start(5); // 50ms
+        }
+
+
+        if (m_enable_logging_pose)
+        {
+          ROS_INFO("Will log pose");
+          std::function<void(uint32_t, logPose*)> cb = std::bind(&CrazyflieROS::onPoseData, this, std::placeholders::_1, std::placeholders::_2);
+
+          logBlockPose.reset(new LogBlock<logPose>(
+            &m_cf,{
+              {"stateEstimate", "x"},
+              {"stateEstimate", "y"},
+              {"stateEstimate", "z"},
+              {"stateEstimateZ", "quat"}
+            }, cb));
+          logBlockPose->start(1); // 10ms
+        }
+
+        if (m_enable_logging_state)
+        {
+          ROS_INFO("Will log state");
+          std::function<void(uint32_t, logState*)> cb5 = std::bind(&CrazyflieROS::onStateData, this, std::placeholders::_1, std::placeholders::_2);
+          logBlockState.reset(new LogBlock<logState>(
+            &m_cf,{
+              {"kalman", "inFlight"},
+              {"sys", "canfly"},
+              {"stabilizer", "thrust"},
+              {"pm", "state"},
+            }, cb5));
+          logBlockState->start(50); // 500ms
+        }
+
+        // custom log blocks
+        size_t i = 0;
+        for (auto& logBlock : m_logBlocks)
+        {
+          ROS_INFO("Will log generic block");
+          std::function<void(uint32_t, std::vector<double>*, void* userData)> cb =
+            std::bind(
+              &CrazyflieROS::onLogCustom,
+              this,
+              std::placeholders::_1,
+              std::placeholders::_2,
+              std::placeholders::_3);
+
+          logBlocksGeneric[i].reset(new LogBlockGeneric(
+            &m_cf,
+            logBlock.variables,
+            (void*)&m_pubLogDataGeneric[i],
+            cb));
+          logBlocksGeneric[i]->start(logBlock.frequency / 10);
+          ++i;
         }
       }
-      m_sentSetpoint = false;
-      m_sentExternalPosition = false;
 
-      // Execute any ROS related functions now
-      m_callback_queue.callAvailable(ros::WallDuration(0.0));
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+      ROS_INFO_NAMED(m_tf_prefix, "Requesting memories...");
+      m_cf.requestMemoryToc();
 
-    // Make sure we turn the engines off
-    for (int i = 0; i < 100; ++i) {
-       m_cf.sendSetpoint(0, 0, 0, 0);
+      ROS_INFO_NAMED(m_tf_prefix, "Ready...");
+      auto end = std::chrono::system_clock::now();
+      std::chrono::duration<double> elapsedSeconds = end-start;
+      ROS_INFO_NAMED(m_tf_prefix, "Elapsed: %f s", elapsedSeconds.count());
+
+      state = running;
+
+      // Send 0 thrust initially for thrust-lock
+      for (int i = 0; i < 100; ++i) {
+         m_cf.sendSetpoint(0, 0, 0, 0);
+      }
+
+      while(!m_isEmergency) {
+        // make sure we ping often enough to stream data out
+        if (m_enableLogging && !m_sentSetpoint && !m_sentExternalPosition) {
+          m_cf.transmitPackets();
+          m_cf.sendPing();
+        }
+        m_sentSetpoint = false;
+        m_sentExternalPosition = false;
+
+        // Execute any ROS related functions now
+        m_callback_queue.callAvailable(ros::WallDuration(0.0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      // Make sure we turn the engines off
+      for (int i = 0; i < 100; ++i) {
+         m_cf.sendSetpoint(0, 0, 0, 0);
+      }
     }
-  }
-  catch(std::runtime_error& e) {
+    catch(std::runtime_error& e)
+    {
       ROS_WARN("Exception %s while running CrazyflieROS ", e.what());
       state = exception;
       while ( !m_isEmergency ) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-  }
+    }
+    n.shutdown();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
   }
 
   void onImuData(uint32_t time_in_ms, logImu* data) {
@@ -1032,6 +1049,31 @@ void cmdPositionSetpoint(
     }
   }
 
+  void onPoseData(uint32_t time_in_ms, logPose* data) {
+    if (m_enable_logging_pose) {
+      geometry_msgs::PoseStamped msg;
+      if (m_use_ros_time) {
+        msg.header.stamp = ros::Time::now();
+      } else {
+        msg.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      msg.header.frame_id = m_tf_prefix + "/base_link";
+
+      msg.pose.position.x = data->x;
+      msg.pose.position.y = data->y;
+      msg.pose.position.z = data->z;
+
+      float q[4];
+      quatdecompress(data->quatCompressed, q);
+      msg.pose.orientation.x = q[0];
+      msg.pose.orientation.y = q[1];
+      msg.pose.orientation.z = q[2];
+      msg.pose.orientation.w = q[3];
+
+      m_pubPose.publish(msg);
+    }
+  }
+
   void onStateData(uint32_t time_in_ms, logState* data) {
     if (m_enable_logging_odom) {
       crazyflie_driver::FlightState msg;
@@ -1073,19 +1115,34 @@ void cmdPositionSetpoint(
 
   void onLinkQuality(float linkQuality) {
       if (linkQuality < 0.7) {
-        ROS_WARN("Link Quality low (%f)", linkQuality);
+        ROS_WARN_NAMED(m_tf_prefix, "Link Quality low (%f)", linkQuality);
       }
   }
 
   void onConsole(const char* msg) {
-    ROS_INFO("CF Console: %s", msg);
+    static std::string messageBuffer;
+    messageBuffer += msg;
+    size_t pos = messageBuffer.find('\n');
+    if (pos != std::string::npos) {
+      messageBuffer[pos] = 0;
+      ROS_INFO_NAMED(m_tf_prefix, "CF Console: %s", messageBuffer.c_str());
+      messageBuffer.erase(0, pos+1);
+    }
+  }
+
+  void onGenericPacket(const ITransport::Ack& ack) {
+    crazyflie_driver::crtpPacket packet;
+    packet.size = ack.size;
+    packet.header = ack.data[0];
+    memcpy(&packet.data[0], &ack.data[1], ack.size);
+    m_pubPackets.publish(packet);
   }
 
   bool setGroupMask(
     crazyflie_driver::SetGroupMask::Request& req,
     crazyflie_driver::SetGroupMask::Response& res)
   {
-    ROS_INFO("SetGroupMask requested");
+    ROS_INFO_NAMED(m_tf_prefix, "SetGroupMask requested");
     m_cf.setGroupMask(req.groupMask);
     return true;
   }
@@ -1094,7 +1151,7 @@ void cmdPositionSetpoint(
     crazyflie_driver::Takeoff::Request& req,
     crazyflie_driver::Takeoff::Response& res)
   {
-    ROS_INFO("Takeoff requested");
+    ROS_INFO_NAMED(m_tf_prefix, "Takeoff requested");
     m_cf.takeoff(req.height, req.duration.toSec(), req.groupMask);
     return true;
   }
@@ -1103,7 +1160,7 @@ void cmdPositionSetpoint(
     crazyflie_driver::Land::Request& req,
     crazyflie_driver::Land::Response& res)
   {
-    ROS_INFO("Land requested");
+    ROS_INFO_NAMED(m_tf_prefix, "Land requested");
     m_cf.land(req.height, req.duration.toSec(), req.groupMask);
     return true;
   }
@@ -1112,7 +1169,7 @@ void cmdPositionSetpoint(
     crazyflie_driver::Stop::Request& req,
     crazyflie_driver::Stop::Response& res)
   {
-    ROS_INFO("Stop requested");
+    ROS_INFO_NAMED(m_tf_prefix, "Stop requested");
     m_cf.stop(req.groupMask);
     return true;
   }
@@ -1121,7 +1178,7 @@ void cmdPositionSetpoint(
     crazyflie_driver::GoTo::Request& req,
     crazyflie_driver::GoTo::Response& res)
   {
-    ROS_INFO("GoTo requested");
+    ROS_INFO_NAMED(m_tf_prefix, "GoTo requested");
     m_cf.goTo(req.goal.x, req.goal.y, req.goal.z, req.yaw, req.duration.toSec(), req.relative, req.groupMask);
     return true;
   }
@@ -1130,7 +1187,7 @@ void cmdPositionSetpoint(
     crazyflie_driver::UploadTrajectory::Request& req,
     crazyflie_driver::UploadTrajectory::Response& res)
   {
-    ROS_INFO("UploadTrajectory requested");
+    ROS_INFO_NAMED(m_tf_prefix, "UploadTrajectory requested");
 
     std::vector<Crazyflie::poly4d> pieces(req.pieces.size());
     for (size_t i = 0; i < pieces.size(); ++i) {
@@ -1138,7 +1195,7 @@ void cmdPositionSetpoint(
           || req.pieces[i].poly_y.size() != 8
           || req.pieces[i].poly_z.size() != 8
           || req.pieces[i].poly_yaw.size() != 8) {
-        ROS_FATAL("Wrong number of pieces!");
+        ROS_FATAL_NAMED(m_tf_prefix, "Wrong number of pieces!");
         return false;
       }
       pieces[i].duration = req.pieces[i].duration.toSec();
@@ -1151,7 +1208,7 @@ void cmdPositionSetpoint(
     }
     m_cf.uploadTrajectory(req.trajectoryId, req.pieceOffset, pieces);
 
-    ROS_INFO("Upload completed!");
+    ROS_INFO_NAMED(m_tf_prefix, "Upload completed!");
     return true;
   }
 
@@ -1159,14 +1216,23 @@ void cmdPositionSetpoint(
     crazyflie_driver::StartTrajectory::Request& req,
     crazyflie_driver::StartTrajectory::Response& res)
   {
-    ROS_INFO("StartTrajectory requested");
+    ROS_INFO_NAMED(m_tf_prefix, "StartTrajectory requested");
     m_cf.startTrajectory(req.trajectoryId, req.timescale, req.reversed, req.relative, req.groupMask);
     return true;
   }
 
+  bool notifySetpointsStop(
+    crazyflie_driver::NotifySetpointsStop::Request& req,
+    crazyflie_driver::NotifySetpointsStop::Response& res)
+  {
+    ROS_INFO_NAMED(m_tf_prefix, "NotifySetpointsStop requested");
+    m_cf.notifySetpointsStop(req.remainValidMillisecs);
+    return true;
+  }
+
 private:
-  Crazyflie m_cf;
   std::string m_tf_prefix;
+  Crazyflie m_cf;
   bool m_isEmergency;
   float m_roll_trim;
   float m_pitch_trim;
@@ -1179,6 +1245,7 @@ private:
   bool m_enable_logging_magnetic_field;
   bool m_enable_logging_pressure;
   bool m_enable_logging_battery;
+  bool m_enable_logging_pose;
   bool m_enable_logging_packets;
   bool m_enable_logging_odom;
   bool m_enable_logging_state;
@@ -1188,6 +1255,7 @@ private:
 
   ros::ServiceServer m_serviceEmergency;
   ros::ServiceServer m_serviceUpdateParams;
+  ros::ServiceServer m_sendPacketServer;
 
   // High-level setpoints
   ros::ServiceServer m_serviceSetGroupMask;
@@ -1197,6 +1265,7 @@ private:
   ros::ServiceServer m_serviceGoTo;
   ros::ServiceServer m_serviceUploadTrajectory;
   ros::ServiceServer m_serviceStartTrajectory;
+  ros::ServiceServer m_serviceNotifySetpointsStop;
 
   ros::Subscriber m_subscribeCmdVel;
   ros::Subscriber m_subscribeCmdFullState;
@@ -1204,11 +1273,14 @@ private:
   ros::Subscriber m_subscribeCmdStop;
   ros::Subscriber m_subscribeCmdPosition;
   ros::Subscriber m_subscribeExternalPosition;
+  ros::Subscriber m_subscribeExternalPose;
+  ros::Subscriber m_subscribeCmdVelocityWorld;
   ros::Publisher m_pubImu;
   ros::Publisher m_pubTemp;
   ros::Publisher m_pubMag;
   ros::Publisher m_pubPressure;
   ros::Publisher m_pubBattery;
+  ros::Publisher m_pubPose;
   ros::Publisher m_pubPackets;
   ros::Publisher m_pubRssi;
   ros::Publisher m_pubOdom;
@@ -1224,12 +1296,14 @@ private:
 
   bool m_sentSetpoint, m_sentExternalPosition;
 
-  std::thread m_thread;
   ros::CallbackQueue m_callback_queue;
 
   std::vector<bool> m_is_flying_cache;
   std::vector<float> m_voltage_cache;
   float m_battery_level;
+
+public:
+    std::thread m_thread;
 };
 
 class CrazyflieServer
@@ -1237,7 +1311,10 @@ class CrazyflieServer
 public:
   CrazyflieServer()
   {
+  }
 
+  ~CrazyflieServer()
+  {
   }
 
   void run()
@@ -1269,7 +1346,8 @@ private:
     crazyflie_driver::AddCrazyflie::Request  &req,
     crazyflie_driver::AddCrazyflie::Response &res)
   {
-    ROS_INFO("Adding %s as %s with trim(%f, %f). Logging: %d, Parameters: %d, Use ROS time: %d",
+    ROS_INFO("Adding crazyflie @ %s as \"%s\":\n"
+             "\t\ttrim: (%f, %f), logging: %d, parameters: %d, use ROS time: %d",
       req.uri.c_str(),
       req.tf_prefix.c_str(),
       req.roll_trim,
@@ -1280,30 +1358,40 @@ private:
 
     // Ignore if the uri is already in use
     if (m_crazyflies.find(req.uri) != m_crazyflies.end()) {
-      ROS_ERROR("Cannot add %s, already added.", req.uri.c_str());
+      ROS_ERROR("Cannot add crazyflie @ %s as it has been already added.", req.uri.c_str());
       return false;
     }
 
-    CrazyflieROS* cf = new CrazyflieROS(
-      req.uri,
-      req.crazyradio_tx_power,
-      req.tf_prefix,
-      req.roll_trim,
-      req.pitch_trim,
-      req.enable_logging,
-      req.enable_parameters,
-      req.log_blocks,
-      req.use_ros_time,
-      req.enable_logging_imu,
-      req.enable_logging_temperature,
-      req.enable_logging_magnetic_field,
-      req.enable_logging_pressure,
-      req.enable_logging_battery,
-      req.enable_logging_packets,
-      req.enable_logging_odom,
-      req.enable_logging_state,
-      req.enable_logging_front_net,
-      req.front_net_frame);
+    std::shared_ptr<CrazyflieROS> cf;
+    try
+    {
+      cf = std::make_shared<CrazyflieROS>(
+        req.uri,
+        req.crazyradio_tx_power,
+        req.tf_prefix,
+        req.roll_trim,
+        req.pitch_trim,
+        req.enable_logging,
+        req.enable_parameters,
+        req.log_blocks,
+        req.use_ros_time,
+        req.enable_logging_imu,
+        req.enable_logging_temperature,
+        req.enable_logging_magnetic_field,
+        req.enable_logging_pressure,
+        req.enable_logging_battery,
+        req.enable_logging_packets,
+        req.enable_logging_pose,
+        req.enable_logging_odom,
+        req.enable_logging_state,
+        req.enable_logging_front_net,
+        req.front_net_frame);
+    }
+    catch(std::exception& e) {
+      ROS_WARN("Cannot connect to crazyflie @ %s", req.uri.c_str());
+      res.result = false;
+      return true;
+    }
 
     while(cf->state == initializing)
     {
@@ -1311,13 +1399,11 @@ private:
     }
     if(cf->state == exception)
     {
-      ROS_ERROR("Cannot add crazyflie with uri %s", req.uri.c_str());
-      cf->stop();
-      delete cf;
+      ROS_ERROR("Cannot initialize crazyflie @ %s", req.uri.c_str());
       res.result = false;
       return true;
     }
-    ROS_INFO("Added crazyflie with uri %s", req.uri.c_str());
+    ROS_INFO("Added crazyflie @ %s", req.uri.c_str());
     m_crazyflies[req.uri] = cf;
     res.result = true;
     return true;
@@ -1332,15 +1418,8 @@ private:
       ROS_ERROR("Cannot remove %s, not connected.", req.uri.c_str());
       return false;
     }
-
-    ROS_INFO("Removing crazyflie at uri %s.", req.uri.c_str());
-
-    m_crazyflies[req.uri]->stop();
-    delete m_crazyflies[req.uri];
     m_crazyflies.erase(req.uri);
-
-    ROS_INFO("Crazyflie %s removed.", req.uri.c_str());
-
+    ROS_INFO("Removed crazyflie @ %s", req.uri.c_str());
     return true;
   }
 
@@ -1392,18 +1471,14 @@ private:
   // }
 
 private:
-  std::map<std::string, CrazyflieROS*> m_crazyflies;
+  std::map<std::string, std::shared_ptr<CrazyflieROS>> m_crazyflies;
 };
-
-
 
 
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "crazyflie_server");
-
   CrazyflieServer cfserver;
   cfserver.run();
-
   return 0;
 }
