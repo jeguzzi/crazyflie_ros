@@ -35,6 +35,8 @@
 #include "sensor_msgs/BatteryState.h"
 #include "nav_msgs/Odometry.h"
 #include "std_msgs/Float32.h"
+#include "std_msgs/Float32MultiArray.h"
+#include "std_msgs/MultiArrayDimension.h"
 #include "tf/transform_broadcaster.h"
 
 //#include <regex>
@@ -117,7 +119,9 @@ public:
     bool enable_logging_battery,
     bool enable_logging_packets,
     bool enable_logging_odom,
-    bool enable_logging_state)
+    bool enable_logging_state,
+    bool enable_logging_front_net,
+    std::string front_net_frame = std::string("base_link"))
     : m_cf(link_uri, rosLogger, crazyradio_tx_power)
     , m_tf_prefix(tf_prefix)
     , m_isEmergency(false)
@@ -135,6 +139,7 @@ public:
     , m_enable_logging_packets(enable_logging_packets)
     , m_enable_logging_odom(enable_logging_odom)
     , m_enable_logging_state(enable_logging_state)
+    , m_enable_logging_front_net(enable_logging_front_net)
     , m_serviceEmergency()
     , m_serviceUpdateParams()
     , m_serviceSetGroupMask()
@@ -158,12 +163,15 @@ public:
     , m_pubRssi()
     , m_pubOdom()
     , m_pubState()
+    , m_pubFrontNetPose()
     , m_tf_broadcaster()
     , m_sentSetpoint(false)
     , m_sentExternalPosition(false)
     , m_is_flying_cache()
     , m_voltage_cache()
-    , m_battery_level(1.0)
+    , m_battery_level(1.0),
+    publish_stabilized_tf(true),
+    front_net_frame(tf_prefix + '/' + front_net_frame)
   {
     state = initializing;
     m_thread = std::thread(&CrazyflieROS::run_safe, this);
@@ -197,6 +205,11 @@ public:
     if(m_pubRssi) m_pubRssi.shutdown();
     if(m_pubOdom) m_pubOdom.shutdown();
     if(m_pubState) m_pubState.shutdown();
+    if(m_pubFrontNetPose)
+    {
+      m_pubFrontNetPose.shutdown();
+      m_pubFrontNetOutput.shutdown();
+    }
     for (size_t i = 0; i < m_pubLogDataGeneric.size(); i++) {
       m_pubLogDataGeneric[i].shutdown();
     }
@@ -294,7 +307,7 @@ private:
   struct logState {
     int8_t flying;
     int8_t can_fly;
-    uint16_t thrust;
+    float thrust;
     int8_t battery_state;
   } __attribute__((packed));
 
@@ -303,7 +316,15 @@ private:
     float charge_current;
     int8_t battery_state;
     uint8_t battery_level;
-    uint16_t thrust;
+    float thrust;
+  } __attribute__((packed));
+
+  struct logFrontNet {
+    float x;
+    float y;
+    float z;
+    float phi;
+    uint32_t lastUpdate;
   } __attribute__((packed));
 
 private:
@@ -526,10 +547,17 @@ void cmdPositionSetpoint(
       m_odom.pose.covariance[0] = -1;
       m_odom.twist.covariance[0] = -1;
       m_odom.pose.pose.orientation.w = 1;
+      m_base_stabilized_frame_id = m_tf_prefix + "/base_stabilized";
     }
     if (m_enable_logging_state) {
       m_pubState = n.advertise<crazyflie_driver::FlightState>(m_tf_prefix + "/state", 1);
     }
+
+    if (m_enable_logging_front_net) {
+      m_pubFrontNetPose= n.advertise<geometry_msgs::PoseStamped>(m_tf_prefix + "/head", 1);
+      m_pubFrontNetOutput= n.advertise<std_msgs::Float32MultiArray>(m_tf_prefix + "/output", 1);
+    }
+
     m_pubRssi = n.advertise<std_msgs::Float32>(m_tf_prefix + "/rssi", 10);
 
     for (auto& logBlock : m_logBlocks)
@@ -593,6 +621,7 @@ void cmdPositionSetpoint(
     std::unique_ptr<LogBlock<logOrientation> > logBlockOrientation;
     std::unique_ptr<LogBlock<logState> > logBlockState;
     std::unique_ptr<LogBlock<logBattery> > logBlockBattery;
+    std::unique_ptr<LogBlock<logFrontNet> > logBlockFrontNet;
 
     std::vector<std::unique_ptr<LogBlockGeneric> > logBlocksGeneric(m_logBlocks.size());
     if (m_enableLogging) {
@@ -648,6 +677,20 @@ void cmdPositionSetpoint(
             {"stabilizer", "thrust"}
           }, cbb));
         logBlockBattery->start(100); // 1000ms
+      }
+
+      if ( m_enable_logging_front_net )
+      {
+        std::function<void(uint32_t, logFrontNet*)> cbfn = std::bind(&CrazyflieROS::onFrontNetData, this, std::placeholders::_1, std::placeholders::_2);
+        logBlockFrontNet.reset(new LogBlock<logFrontNet>(
+          &m_cf,{
+            {"frontnet", "x"},
+            {"frontnet", "y"},
+            {"frontnet", "z"},
+            {"frontnet", "phi"},
+            {"frontnet", "lastUpdate"},
+          }, cbfn));
+        logBlockFrontNet->start(5); // 50ms
       }
 
       if (m_enable_logging_odom)
@@ -838,7 +881,7 @@ void cmdPositionSetpoint(
     return sigmoid(voltage, 3.4917872, 10.02713555);
   }
 
-  void update_voltage(float voltage, uint16_t thrust, uint8_t level, int8_t state)
+  void update_voltage(float voltage, float thrust, uint8_t level, int8_t state)
   {
     if(state == 1 || state == 2)
       {
@@ -896,6 +939,43 @@ void cmdPositionSetpoint(
     }
   }
 
+  void onFrontNetData(uint32_t time_in_ms, logFrontNet* data) {
+    if (m_enable_logging_front_net) {
+      if (data->lastUpdate ==0 || data->lastUpdate == frontNetLastUpdate) return;
+      frontNetLastUpdate = data->lastUpdate;
+      geometry_msgs::PoseStamped msg = geometry_msgs::PoseStamped();
+      if (m_use_ros_time) {
+        msg.header.stamp = ros::Time::now();
+      } else {
+        msg.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      // Depending on the models, the frame should be either base_link
+      // (if not stabilized/pitch invariant) or base_stabilized
+
+      msg.header.frame_id = front_net_frame;
+      msg.pose.position.x = data->x;
+      msg.pose.position.y = data->y;
+      msg.pose.position.z = data->z;
+      // The network output the relative head yaw - \pi.
+      // => head yaw = \phi + \pi
+      float phi = data->phi + M_PI;
+      msg.pose.orientation.w = cos(0.5 * phi);
+      msg.pose.orientation.z = sin(0.5 * phi);
+      m_pubFrontNetPose.publish(msg);
+
+      std_msgs::Float32MultiArray o_msg;
+      std_msgs::MultiArrayDimension dim;
+      dim.size = 4;
+      dim.stride = 1;
+      o_msg.data.push_back(data->x);
+      o_msg.data.push_back(data->y);
+      o_msg.data.push_back(data->z);
+      o_msg.data.push_back(data->phi);
+      o_msg.layout.dim.push_back(dim);
+      m_pubFrontNetOutput.publish(o_msg);
+    }
+  }
+
   void onOrientationData(uint32_t time_in_ms, logOrientation* data) {
     if (m_enable_logging_odom) {
       m_odom.pose.pose.orientation.x = data->qx;
@@ -930,13 +1010,25 @@ void cmdPositionSetpoint(
       tf::Transform transform;
 
       transform.setOrigin(tf::Vector3(data->x, data->y, data->z));
-
-      transform.setRotation(tf::Quaternion(m_odom.pose.pose.orientation.x,
+      tf::Quaternion q = tf::Quaternion(m_odom.pose.pose.orientation.x,
             m_odom.pose.pose.orientation.y, m_odom.pose.pose.orientation.z,
-            m_odom.pose.pose.orientation.w));
+            m_odom.pose.pose.orientation.w);
+      transform.setRotation(q);
       m_tf_broadcaster.sendTransform(
         tf::StampedTransform(transform, m_odom.header.stamp, m_odom.header.frame_id,
                              m_odom.child_frame_id));
+
+      if(publish_stabilized_tf)
+      {
+        tf::Transform transform_swing;
+        tf::Quaternion twist = tf::Quaternion(0, 0, q.getZ(), q.getW()).normalized();
+        tf::Quaternion swing = q.inverse() * twist;
+        transform_swing.setRotation(swing);
+        transform_swing.setOrigin(tf::Vector3(0, 0, 0));
+        m_tf_broadcaster.sendTransform(
+          tf::StampedTransform(transform_swing, m_odom.header.stamp, m_odom.child_frame_id,
+                               m_base_stabilized_frame_id));
+      }
     }
   }
 
@@ -1090,6 +1182,9 @@ private:
   bool m_enable_logging_packets;
   bool m_enable_logging_odom;
   bool m_enable_logging_state;
+  bool m_enable_logging_front_net;
+
+  uint32_t frontNetLastUpdate;
 
   ros::ServiceServer m_serviceEmergency;
   ros::ServiceServer m_serviceUpdateParams;
@@ -1118,8 +1213,13 @@ private:
   ros::Publisher m_pubRssi;
   ros::Publisher m_pubOdom;
   ros::Publisher m_pubState;
+  ros::Publisher m_pubFrontNetPose;
+  ros::Publisher m_pubFrontNetOutput;
   tf::TransformBroadcaster m_tf_broadcaster;
   nav_msgs::Odometry m_odom;
+  std::string m_base_stabilized_frame_id;
+  bool publish_stabilized_tf;
+  std::string front_net_frame;
   std::vector<ros::Publisher> m_pubLogDataGeneric;
 
   bool m_sentSetpoint, m_sentExternalPosition;
@@ -1201,7 +1301,9 @@ private:
       req.enable_logging_battery,
       req.enable_logging_packets,
       req.enable_logging_odom,
-      req.enable_logging_state);
+      req.enable_logging_state,
+      req.enable_logging_front_net,
+      req.front_net_frame);
 
     while(cf->state == initializing)
     {

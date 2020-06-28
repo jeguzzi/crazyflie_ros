@@ -15,5 +15,7 @@ bool enable_logging_battery
 bool enable_logging_packets
 bool enable_logging_odom
 bool enable_logging_state
+bool enable_logging_front_net
+string front_net_frame
 ---
 bool result
